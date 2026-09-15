@@ -1,10 +1,26 @@
 import json
+import os
+import pathlib
+import re
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fairsharing_mcp.client import FAIRsharingAuthError, FAIRsharingClient, FAIRsharingError
-from fairsharing_mcp.formatters import build_fairsharing_url
-from fairsharing_mcp.graph_utils import merge_graphs, parse_graph
+from fairsharing_mcp.constants import (
+    AMBIGUOUS_EDGE_COLORS,
+    COLOR_UNREACHABLE_LABELS,
+    EDGE_COLOR_TO_RELATIONSHIP,
+    RECORD_ASSOCIATION_LABELS,
+    RELATIONSHIP_INFLUENCE_WEIGHTS,
+    RELATIONSHIP_WEIGHTS,
+)
+from fairsharing_mcp.formatters import (
+    build_fairsharing_url,
+    format_record_detail,
+    format_record_summary,
+    truncation_notice,
+)
+from fairsharing_mcp.graph_utils import build_label_overrides, merge_graphs, parse_graph
 from fairsharing_mcp.helpers import build_advanced_search_where, matches_date_range
 from fairsharing_mcp.tools.comparison import (
     analyze_deprecation_impact,
@@ -24,7 +40,11 @@ from fairsharing_mcp.tools.discovery import (
     suggest_graph_starting_points,
     suggest_workflow,
 )
-from fairsharing_mcp.tools.graph import detect_circular_dependencies, find_record_connections
+from fairsharing_mcp.tools.graph import (
+    analyze_record_ecosystem,
+    detect_circular_dependencies,
+    find_record_connections,
+)
 from fairsharing_mcp.tools.graph_analysis import (
     analyze_graph_comprehensive,
     analyze_path_criticality,
@@ -72,6 +92,7 @@ from fairsharing_mcp.tools.records import (
     get_record_graph,
     get_record_types,
     get_records_batch,
+    list_associations,
     resolve_identifier,
 )
 from fairsharing_mcp.tools.search import (
@@ -7877,7 +7898,6 @@ class TestFairsharingUrlInOutputs(unittest.IsolatedAsyncioTestCase):
             "https://fairsharing.org/FAIRsharing.9kahy4",
         )
 
-
     # ── advancedSearch integration tests ────────────────────────────────
 
     # -- build_advanced_search_where unit tests --
@@ -8172,6 +8192,703 @@ class TestFairsharingUrlInOutputs(unittest.IsolatedAsyncioTestCase):
         call_args = mock_client.query.call_args
         query_str = call_args[0][0]
         self.assertIn("advancedSearch", query_str)
+
+
+class TestRelationshipLabelMapping(unittest.TestCase):
+    """Edge colour → relationship label mapping.
+
+    The mapping in constants.py was derived empirically by joining graph edge colours
+    against the authoritative `recordAssocLabel` over ~950 sampled records. These tests
+    pin that result. Before the fix, five of eleven mapped colours were wrong and two
+    colours were unmapped — and no test caught it, because the suite only ever exercised
+    pink/orange/grey, the three that happened to be correct.
+    """
+
+    # (colour, expected label) — every pair verified against live API data.
+    VERIFIED = [
+        ("#e6e600", "collects"),
+        ("orange", "recommends"),
+        ("grey", "related_to"),
+        ("#7ae827", "has_associated_metric"),
+        ("pink", "implements"),
+        ("green", "profiles"),
+        ("black", "extends"),
+        ("red", "deprecates"),
+        ("indigo", "outputs"),
+        ("#e827a4", "measures_principle"),
+        ("blue", "accepts"),
+    ]
+
+    def test_colours_map_to_empirically_verified_labels(self):
+        for colour, expected in self.VERIFIED:
+            with self.subTest(colour=colour):
+                self.assertEqual(
+                    EDGE_COLOR_TO_RELATIONSHIP.get(colour),
+                    expected,
+                    f"colour {colour!r} should map to {expected!r}",
+                )
+
+    def test_regression_previously_wrong_mappings(self):
+        """These five were silently mislabelled before the fix."""
+        self.assertNotEqual(EDGE_COLOR_TO_RELATIONSHIP["black"], "related_to")
+        self.assertNotEqual(EDGE_COLOR_TO_RELATIONSHIP["green"], "extends")
+        self.assertNotEqual(EDGE_COLOR_TO_RELATIONSHIP["indigo"], "profiles")
+        self.assertNotEqual(EDGE_COLOR_TO_RELATIONSHIP["blue"], "shares_data_with")
+        self.assertNotEqual(EDGE_COLOR_TO_RELATIONSHIP["brown"], "other")
+
+    def test_metric_colours_no_longer_fall_through_to_related_to(self):
+        """has_associated_metric / measures_principle were unmapped entirely."""
+        for colour in ("#7ae827", "#e827a4"):
+            with self.subTest(colour=colour):
+                self.assertIn(colour, EDGE_COLOR_TO_RELATIONSHIP)
+
+    def test_every_api_label_has_a_dijkstra_weight(self):
+        """A missing label silently degrades to the 5.0 worst-case distance."""
+        missing = [
+            label for label in RECORD_ASSOCIATION_LABELS if label not in RELATIONSHIP_WEIGHTS
+        ]
+        self.assertEqual(missing, [], f"labels without a Dijkstra weight: {missing}")
+
+    def test_every_api_label_has_an_influence_weight(self):
+        """A missing label silently degrades to the 0.2 PageRank floor."""
+        missing = [
+            label
+            for label in RECORD_ASSOCIATION_LABELS
+            if label not in RELATIONSHIP_INFLUENCE_WEIGHTS
+        ]
+        self.assertEqual(missing, [], f"labels without an influence weight: {missing}")
+
+    def test_mapped_labels_are_all_real_api_labels(self):
+        """Colour inference must not invent labels outside the API vocabulary."""
+        allowed = set(RECORD_ASSOCIATION_LABELS) | {"other"}
+        unknown = set(EDGE_COLOR_TO_RELATIONSHIP.values()) - allowed
+        self.assertEqual(unknown, set(), f"colour map produces non-API labels: {unknown}")
+
+    def test_parse_graph_applies_corrected_colours(self):
+        graph = {
+            "name": "T",
+            "nodes": [{"key": str(i), "attributes": {"label": f"N{i}"}} for i in range(1, 7)],
+            "edges": [
+                {"source": "1", "target": "2", "attributes": {"color": "black"}},
+                {"source": "1", "target": "3", "attributes": {"color": "green"}},
+                {"source": "1", "target": "4", "attributes": {"color": "indigo"}},
+                {"source": "1", "target": "5", "attributes": {"color": "#7ae827"}},
+                {"source": "1", "target": "6", "attributes": {"color": "#e827a4"}},
+            ],
+        }
+        rels = {t: rel for _, t, rel in parse_graph(graph).edges}
+        self.assertEqual(rels["2"], "extends")
+        self.assertEqual(rels["3"], "profiles")
+        self.assertEqual(rels["4"], "outputs")
+        self.assertEqual(rels["5"], "has_associated_metric")
+        self.assertEqual(rels["6"], "measures_principle")
+
+    def test_brown_is_documented_as_ambiguous(self):
+        """brown carries both shares_data_with and part_of; colour cannot disambiguate."""
+        self.assertIn("brown", AMBIGUOUS_EDGE_COLORS)
+        self.assertIn("part_of", AMBIGUOUS_EDGE_COLORS["brown"])
+        self.assertIn("part_of", COLOR_UNREACHABLE_LABELS)
+
+
+class TestLabelOverrides(unittest.TestCase):
+    """Authoritative `recordAssocLabel` must win over lossy colour inference."""
+
+    def test_build_label_overrides_covers_both_directions(self):
+        record = {
+            "recordAssociations": [
+                {"linkedRecord": {"id": "20"}, "recordAssocLabel": "part_of"},
+            ],
+            "reverseRecordAssociations": [
+                {"fairsharingRecord": {"id": "30"}, "recordAssocLabel": "shares_code_with"},
+            ],
+        }
+        overrides = build_label_overrides(record, 10)
+        self.assertEqual(overrides[("10", "20")], "part_of")
+        self.assertEqual(overrides[("30", "10")], "shares_code_with")
+
+    def test_override_beats_ambiguous_colour(self):
+        """A brown edge that is really part_of resolves correctly with an override."""
+        graph = {
+            "name": "T",
+            "nodes": [{"key": "10", "attributes": {}}, {"key": "20", "attributes": {}}],
+            "edges": [{"source": "10", "target": "20", "attributes": {"color": "brown"}}],
+        }
+        # Without the override, brown resolves to its more common label.
+        self.assertEqual(parse_graph(graph).edges[0][2], "shares_data_with")
+        # With it, the true label wins.
+        overrides = build_label_overrides(
+            {"recordAssociations": [{"linkedRecord": {"id": "20"}, "recordAssocLabel": "part_of"}]},
+            10,
+        )
+        self.assertEqual(parse_graph(graph, label_overrides=overrides).edges[0][2], "part_of")
+
+    def test_parse_graph_unchanged_without_overrides(self):
+        graph = {
+            "name": "T",
+            "nodes": [{"key": "1", "attributes": {}}, {"key": "2", "attributes": {}}],
+            "edges": [{"source": "1", "target": "2", "attributes": {"color": "pink"}}],
+        }
+        self.assertEqual(parse_graph(graph).edges, parse_graph(graph, None).edges)
+
+    def test_unknown_colour_still_falls_back_to_related_to(self):
+        graph = {
+            "name": "T",
+            "nodes": [{"key": "1", "attributes": {}}, {"key": "2", "attributes": {}}],
+            "edges": [{"source": "1", "target": "2", "attributes": {"color": "chartreuse"}}],
+        }
+        self.assertEqual(parse_graph(graph).edges[0][2], "related_to")
+
+
+def _assoc_record(n_out=0, n_in=0, out_label="has_associated_metric", in_label="implements"):
+    """Build a mock record with n_out outgoing and n_in incoming associations."""
+    return {
+        "fairsharingRecord": {
+            "id": "7456",
+            "name": "FAIR Benchmark",
+            "registry": "FAIRassist",
+            "recordAssociations": [
+                {
+                    "linkedRecord": {
+                        "id": str(1000 + i),
+                        "name": f"Metric {i}",
+                        "abbreviation": "",
+                        "registry": "Standard",
+                        "type": "model/format",
+                        "status": "ready",
+                        "doi": f"10.25504/FAIRsharing.out{i}",
+                    },
+                    "recordAssocLabel": out_label,
+                }
+                for i in range(n_out)
+            ],
+            "reverseRecordAssociations": [
+                {
+                    "fairsharingRecord": {
+                        "id": str(2000 + i),
+                        "name": f"Consumer {i}",
+                        "abbreviation": "",
+                        "registry": "Database",
+                        "type": "repository",
+                        "status": "ready",
+                        "doi": f"10.25504/FAIRsharing.in{i}",
+                    },
+                    "recordAssocLabel": in_label,
+                }
+                for i in range(n_in)
+            ],
+        }
+    }
+
+
+class TestListAssociations(unittest.IsolatedAsyncioTestCase):
+    """The complete-enumeration tool: no silent truncation, no direction conflation."""
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_paginates_without_dropping_anything(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=120)
+
+        seen = []
+        for page in (1, 2, 3):
+            payload = json.loads(
+                await list_associations(7456, page=page, per_page=50, output_format="json")
+            )
+            seen += [a["id"] for a in payload["associations"]]
+            self.assertEqual(payload["total_count"], 120)
+            self.assertEqual(payload["total_pages"], 3)
+            self.assertEqual(payload["has_next_page"], page < 3)
+
+        self.assertEqual(len(seen), 120)
+        self.assertEqual(len(set(seen)), 120, "pages must not overlap or skip entries")
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_available_labels_visible_on_first_page(self, mock_get_client):
+        """A caller on page 1 must be able to see the whole landscape."""
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=120)
+
+        payload = json.loads(await list_associations(7456, per_page=5, output_format="json"))
+        self.assertEqual(len(payload["associations"]), 5)
+        self.assertEqual(payload["available_labels"]["outgoing"]["has_associated_metric"], 120)
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_directions_are_not_conflated(self, mock_get_client):
+        """The defect in analyze_record_ecosystem's by_relationship must not recur here."""
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(
+            n_out=10, n_in=4, out_label="profiles", in_label="profiles"
+        )
+
+        payload = json.loads(await list_associations(7456, direction="both", output_format="json"))
+        self.assertEqual(payload["available_labels"]["outgoing"]["profiles"], 10)
+        self.assertEqual(payload["available_labels"]["incoming"]["profiles"], 4)
+        dirs = {a["direction"] for a in payload["associations"]}
+        self.assertEqual(dirs, {"outgoing", "incoming"})
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_direction_filter_selects_one_side(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=10, n_in=4)
+
+        out = json.loads(await list_associations(7456, direction="outgoing", output_format="json"))
+        inc = json.loads(await list_associations(7456, direction="incoming", output_format="json"))
+        self.assertEqual(out["total_count"], 10)
+        self.assertEqual(inc["total_count"], 4)
+        self.assertNotIn("incoming", out["available_labels"])
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_label_filter(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        rec = _assoc_record(n_out=5)
+        rec["fairsharingRecord"]["recordAssociations"][0]["recordAssocLabel"] = "related_to"
+        mock_client.query.return_value = rec
+
+        payload = json.loads(
+            await list_associations(7456, label=["has_associated_metric"], output_format="json")
+        )
+        self.assertEqual(payload["total_count"], 4)
+        # Breakdown is pre-filter, so the excluded label is still visible.
+        self.assertEqual(payload["available_labels"]["outgoing"]["related_to"], 1)
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_registry_filter(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=3, n_in=2)
+
+        payload = json.loads(
+            await list_associations(
+                7456, direction="both", registry=["Database"], output_format="json"
+            )
+        )
+        self.assertEqual(payload["total_count"], 2)
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_markdown_states_completeness_and_next_page(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=60)
+
+        first = await list_associations(7456, per_page=50)
+        self.assertIn("page=2", first)
+        self.assertIn("has_associated_metric=60", first)
+
+        last = await list_associations(7456, page=2, per_page=50)
+        self.assertIn("last page", last)
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_markdown_links_use_doi_not_numeric_id(self, mock_get_client):
+        """URLs must come from the DOI; constructing them from numeric IDs is forbidden."""
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=1)
+
+        result = await list_associations(7456)
+        self.assertIn("https://fairsharing.org/FAIRsharing.out0", result)
+        self.assertNotIn("fairsharing.org/1000", result)
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_record_not_found(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = {"fairsharingRecord": None}
+
+        self.assertIn("No record found", await list_associations(999999))
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_api_error_is_reported_not_swallowed(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.side_effect = FAIRsharingError("boom")
+
+        self.assertIn("Error fetching associations", await list_associations(7456))
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_empty_record_reports_zero_not_error(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=0, n_in=0)
+
+        payload = json.loads(await list_associations(7456, output_format="json"))
+        self.assertEqual(payload["total_count"], 0)
+        self.assertEqual(payload["total_pages"], 1)
+        self.assertFalse(payload["has_next_page"])
+
+
+class TestGetRecordJsonAssociations(unittest.IsolatedAsyncioTestCase):
+    """get_record's JSON mode used to omit associations entirely, making it strictly
+    less informative than the markdown mode it was meant to be an escape hatch from."""
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_json_includes_associations(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=3, n_in=2)
+
+        payload = json.loads(await get_record(7456, output_format="json"))
+        self.assertEqual(len(payload["record_associations"]), 3)
+        self.assertEqual(len(payload["reverse_record_associations"]), 2)
+        self.assertEqual(payload["association_counts"], {"outgoing": 3, "incoming": 2})
+        self.assertFalse(payload["associations_truncated"])
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_json_labels_and_urls_present(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=1)
+
+        entry = json.loads(await get_record(7456, output_format="json"))["record_associations"][0]
+        self.assertEqual(entry["label"], "has_associated_metric")
+        self.assertEqual(entry["fairsharing_url"], "https://fairsharing.org/FAIRsharing.out0")
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_json_caps_and_flags_large_lists(self, mock_get_client):
+        """Counts stay exact even when the embedded lists are capped."""
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=250)
+
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_JSON_ASSOCIATIONS": "100"}):
+            payload = json.loads(await get_record(7456, output_format="json"))
+        self.assertEqual(len(payload["record_associations"]), 100)
+        self.assertEqual(payload["association_counts"]["outgoing"], 250)
+        self.assertTrue(payload["associations_truncated"])
+        self.assertIn("fairsharing_list_associations", payload["associations_note"])
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_json_uncapped_when_limit_zero(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=250)
+
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_JSON_ASSOCIATIONS": "0"}):
+            payload = json.loads(await get_record(7456, output_format="json"))
+        self.assertEqual(len(payload["record_associations"]), 250)
+        self.assertFalse(payload["associations_truncated"])
+
+
+class TestFormatRecordDetailAssociations(unittest.TestCase):
+    """Regression cover for the association block in format_record_detail."""
+
+    @staticmethod
+    def _record(n_out, n_in):
+        return {
+            "id": "1",
+            "name": "R",
+            "registry": "Database",
+            "type": "repository",
+            "status": "ready",
+            "recordAssociations": [
+                {
+                    "linkedRecord": {"id": str(100 + i), "name": f"Out{i}", "registry": "Standard"},
+                    "recordAssocLabel": "implements",
+                }
+                for i in range(n_out)
+            ],
+            "reverseRecordAssociations": [
+                {
+                    "fairsharingRecord": {
+                        "id": str(200 + i),
+                        "name": f"In{i}",
+                        "registry": "Policy",
+                    },
+                    "recordAssocLabel": "recommends",
+                }
+                for i in range(n_in)
+            ],
+        }
+
+    def test_incoming_only_does_not_crash(self):
+        """Zero outgoing plus some incoming raised UnboundLocalError: assoc_limit was
+        bound inside the outgoing branch but read by the incoming one. Live records
+        2000 and 3000 have exactly this shape."""
+        out = format_record_detail(self._record(0, 2))
+        self.assertIn("Related Records (Incoming)", out)
+        self.assertNotIn("Related Records (Outgoing)", out)
+
+    def test_outgoing_only_still_works(self):
+        out = format_record_detail(self._record(2, 0))
+        self.assertIn("Related Records (Outgoing)", out)
+        self.assertNotIn("Related Records (Incoming)", out)
+
+    def test_no_associations_renders_neither_section(self):
+        out = format_record_detail(self._record(0, 0))
+        self.assertNotIn("Related Records", out)
+
+    def test_truncation_notice_states_counts_and_remedy(self):
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_ASSOCIATIONS": "5"}):
+            out = format_record_detail(self._record(30, 0))
+        self.assertIn("Showing 5 of 30", out)
+        self.assertIn("fairsharing_list_associations", out)
+
+    def test_no_notice_when_nothing_is_hidden(self):
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_ASSOCIATIONS": "50"}):
+            out = format_record_detail(self._record(3, 0))
+        self.assertNotIn("Showing", out)
+
+
+class TestEcosystemDirectionSeparation(unittest.IsolatedAsyncioTestCase):
+    """analyze_record_ecosystem merged both directions into one by_relationship dict,
+    and emitted every association with no cap (461 KB on record 6225)."""
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_directions_are_separate(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        # Same label on both sides — the case that produced a silently merged list.
+        mock_client.query.return_value = _assoc_record(
+            n_out=10, n_in=4, out_label="profiles", in_label="profiles"
+        )
+
+        payload = json.loads(await analyze_record_ecosystem(1, output_format="json"))
+        self.assertEqual(payload["outgoing"]["label_counts"]["profiles"], 10)
+        self.assertEqual(payload["incoming"]["label_counts"]["profiles"], 4)
+        self.assertEqual(payload["outgoing"]["by_relationship"]["profiles"]["count"], 10)
+        self.assertEqual(payload["incoming"]["by_relationship"]["profiles"]["count"], 4)
+        self.assertEqual(payload["total_outgoing"], 10)
+        self.assertEqual(payload["total_incoming"], 4)
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_counts_exact_while_record_lists_capped(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=1042, out_label="collects")
+
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_ECOSYSTEM_GROUP": "15"}):
+            payload = json.loads(await analyze_record_ecosystem(6225, output_format="json"))
+        group = payload["outgoing"]["by_relationship"]["collects"]
+        self.assertEqual(group["count"], 1042, "count must never be capped")
+        self.assertEqual(len(group["records"]), 15)
+        self.assertTrue(group["truncated"])
+        self.assertTrue(payload["records_truncated"])
+        self.assertIn("fairsharing_list_associations", payload["note"])
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_registry_counts_per_direction(self, mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=3, n_in=2)
+
+        payload = json.loads(await analyze_record_ecosystem(1, output_format="json"))
+        self.assertEqual(payload["outgoing"]["registry_counts"], {"Standard": 3})
+        self.assertEqual(payload["incoming"]["registry_counts"], {"Database": 2})
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_markdown_group_cap_is_configurable(self, mock_get_client):
+        """The cap was a hardcoded 15 that no environment variable could reach."""
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = _assoc_record(n_out=40, out_label="collects")
+
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_ECOSYSTEM_GROUP": "5"}):
+            tight = await analyze_record_ecosystem(1)
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_ECOSYSTEM_GROUP": "0"}):
+            full = await analyze_record_ecosystem(1)
+
+        self.assertIn("Showing 5 of 40", tight)
+        self.assertIn("fairsharing_list_associations", tight)
+        self.assertNotIn("Showing", full)
+        self.assertGreater(len(full), len(tight))
+
+
+class TestTruncationNotice(unittest.TestCase):
+    """The shared truncation notice. Every capped list must state its true total."""
+
+    def test_states_shown_and_total(self):
+        self.assertEqual(truncation_notice(15, 41), "_Showing 15 of 41._")
+
+    def test_includes_item_noun(self):
+        self.assertEqual(truncation_notice(15, 41, "metrics"), "_Showing 15 of 41 metrics._")
+
+    def test_includes_remedy(self):
+        note = truncation_notice(20, 41, "records", remedy="Call `x` for the rest.")
+        self.assertIn("Showing 20 of 41 records.", note)
+        self.assertIn("Call `x` for the rest.", note)
+
+    def test_indent_is_preserved_outside_the_italics(self):
+        note = truncation_notice(5, 9, "items", indent="  ")
+        self.assertTrue(note.startswith("  _"))
+        self.assertTrue(note.endswith("_"))
+
+
+class TestTruncationSweep(unittest.TestCase):
+    """Guards the sweep: no message may report only what is hidden."""
+
+    OLD_PATTERN = re.compile(r"_\(\.{0,3}and .*more\)_")
+
+    def test_no_old_style_messages_remain(self):
+        """'(and 21 more)' gives a count of the hidden but not the total or the remedy.
+        That phrasing is what led a client to conclude the data was unavailable."""
+        src = pathlib.Path(__file__).resolve().parent.parent / "src" / "fairsharing_mcp"
+        offenders = []
+        for path in src.rglob("*.py"):
+            for i, line in enumerate(path.read_text().splitlines(), start=1):
+                if self.OLD_PATTERN.search(line):
+                    offenders.append(f"{path.name}:{i}")
+        self.assertEqual(offenders, [], f"old-style truncation messages found: {offenders}")
+
+    def test_summary_subject_truncation_states_total(self):
+        record = {
+            "id": "1",
+            "name": "R",
+            "registry": "Standard",
+            "subjects": [{"label": f"S{i}"} for i in range(12)],
+        }
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_SUBJECTS": "3"}):
+            out = format_record_summary(record)
+        self.assertIn("Showing 3 of 12 subjects", out)
+
+    def test_detail_taxonomy_truncation_states_total(self):
+        record = {
+            "id": "1",
+            "name": "R",
+            "registry": "Database",
+            "taxonomies": [{"label": f"T{i}"} for i in range(25)],
+        }
+        with patch.dict(os.environ, {"FAIRSHARING_DISPLAY_MAX_TAXONOMIES": "4"}):
+            out = format_record_detail(record)
+        self.assertIn("Showing 4 of 25 taxonomies", out)
+
+
+class TestResolveNumericUrl(unittest.IsolatedAsyncioTestCase):
+    """A numeric-ID URL is not a canonical citation form, but the site serves it and
+    users paste it, so resolving it to the canonical URL is exactly this tool's job."""
+
+    @staticmethod
+    def _mock(mock_get_client):
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = {
+            "fairsharingRecord": {
+                "id": "7162",
+                "name": "FAIR Benchmark",
+                "registry": "FAIRassist",
+                "type": "benchmark",
+                "status": "ready",
+                "doi": "10.25504/FAIRsharing.abc123",
+            }
+        }
+        return mock_client
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_numeric_url_resolves(self, mock_get_client):
+        self._mock(mock_get_client)
+        out = await resolve_identifier("https://fairsharing.org/7162")
+        self.assertIn("FAIR Benchmark", out)
+        self.assertIn("https://fairsharing.org/FAIRsharing.abc123", out)
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_numeric_url_variants(self, mock_get_client):
+        self._mock(mock_get_client)
+        for ident in (
+            "https://fairsharing.org/7162",
+            "https://fairsharing.org/7162/",
+            "http://fairsharing.org/7162",
+            "https://www.fairsharing.org/7162",
+            "https://fairsharing.org/7162?x=1",
+        ):
+            with self.subTest(identifier=ident):
+                self.assertIn("FAIR Benchmark", await resolve_identifier(ident))
+
+    @patch("fairsharing_mcp.app.get_client")
+    async def test_doi_suffix_url_still_resolves_by_doi_not_id(self, mock_get_client):
+        """The DOI-form URL must keep going through the DOI path, not the numeric one."""
+        mock_client = AsyncMock()
+        mock_get_client.return_value = mock_client
+        mock_client.query.return_value = {
+            "searchFairsharingRecords": {
+                "records": [
+                    {
+                        "id": "2521",
+                        "name": "FAIRsharing",
+                        "registry": "Database",
+                        "doi": "10.25504/FAIRsharing.2abjs5",
+                    }
+                ],
+                "totalCount": 1,
+                "totalPages": 1,
+            }
+        }
+        out = await resolve_identifier("https://fairsharing.org/FAIRsharing.2abjs5")
+        self.assertIn("FAIRsharing", out)
+        self.assertIn("searchFairsharingRecords", mock_client.query.call_args[0][0])
+
+
+def _version_key(v: str) -> list[int]:
+    """Coarse version tuple for comparison. Sufficient for the release-only versions
+    we pin; pre-release suffixes are truncated rather than ordered precisely."""
+    parts = re.split(r"[.\-+]", v)
+    out = []
+    for part in parts[:4]:
+        m = re.match(r"^(\d+)", part)
+        out.append(int(m.group(1)) if m else 0)
+    return out
+
+
+class TestDependencySecurityFloors(unittest.TestCase):
+    """The installed environment must satisfy the security floors declared in
+    pyproject.toml's [tool.uv] constraint-dependencies.
+
+    Those floors exist because 28 GitHub advisories (56 alerts, counted once per
+    manifest) were open against transitive dependencies reached through `mcp`. A
+    `uv lock --upgrade` that silently dropped one would re-open the alert with nothing
+    else failing, so it is asserted here rather than left to Dependabot to re-detect.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+            raise unittest.SkipTest("tomllib unavailable")
+        root = pathlib.Path(__file__).resolve().parent.parent
+        data = tomllib.loads((root / "pyproject.toml").read_text())
+        cls.constraints = data.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+        cls.declared = data["project"]["dependencies"]
+
+    def test_constraints_are_declared(self):
+        """Guards against the constraint block being deleted wholesale."""
+        self.assertGreaterEqual(
+            len(self.constraints), 7, "security constraint floors are missing from pyproject.toml"
+        )
+
+    def test_installed_versions_meet_every_floor(self):
+        import importlib.metadata as md
+
+        failures = []
+        for spec in self.constraints:
+            m = re.match(r"^([A-Za-z0-9_.\-]+)\s*>=\s*([0-9][^,\s]*)$", spec)
+            self.assertIsNotNone(m, f"unparsed constraint: {spec!r}")
+            name, floor = m.group(1), m.group(2)
+            try:
+                installed = md.version(name)
+            except md.PackageNotFoundError:
+                continue  # not installed in this environment; nothing to verify
+            if _version_key(installed) < _version_key(floor):
+                failures.append(f"{name} {installed} < required {floor}")
+        self.assertEqual(failures, [], f"vulnerable dependency versions installed: {failures}")
+
+    def test_mcp_major_version_is_capped(self):
+        """mcp 2.x is a new major line. The dependency was previously unbounded, so a
+        fresh install could pull it and break the server with no local signal."""
+        import importlib.metadata as md
+
+        self.assertTrue(
+            any(d.startswith("mcp[cli]") and "<2" in d for d in self.declared),
+            "mcp must keep an upper bound below 2.0.0",
+        )
+        self.assertEqual(_version_key(md.version("mcp"))[0], 1, "installed mcp is not 1.x")
+
+    def test_httpx_major_version_is_capped(self):
+        self.assertTrue(
+            any(d.startswith("httpx") and "<1" in d for d in self.declared),
+            "httpx must keep an upper bound below 1.0.0",
+        )
 
 
 if __name__ == "__main__":

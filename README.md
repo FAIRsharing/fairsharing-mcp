@@ -1,6 +1,6 @@
 # fairsharing-mcp
 
-An MCP (Model Context Protocol) server that exposes the [FAIRsharing](https://fairsharing.org) GraphQL API as **96 tools** for discovering, analyzing, and comparing data standards, databases, and policies in life sciences research.
+An MCP (Model Context Protocol) server that exposes the [FAIRsharing](https://fairsharing.org) GraphQL API as **97 tools** for discovering, analyzing, and comparing data standards, databases, and policies in life sciences research.
 
 [FAIRsharing](https://fairsharing.org) is a curated registry of standards, databases, and data policies used and recommended by journals, funders, and institutions. This MCP server gives AI assistants structured access to its knowledge graph.
 
@@ -127,10 +127,13 @@ Add to `.vscode/settings.json`:
 | `FAIRSHARING_MAX_SCAN` | No | Max records to scan for date filtering (default: 2000, max: 50000) |
 | `FAIRSHARING_MAX_PER_PAGE` | No | Max results per page (default: 50, API cap: 50) |
 | `FAIRSHARING_TRUNCATION_WARNING` | No | Show truncation warnings (default: true, set to 0 to disable) |
+| `FAIRSHARING_DISPLAY_MAX_ASSOCIATIONS` | No | Associations shown per direction in `get_record` markdown (default: 20, 0 = all) |
+| `FAIRSHARING_DISPLAY_MAX_JSON_ASSOCIATIONS` | No | Associations embedded in `get_record` JSON (default: 100, 0 = all; counts always exact) |
+| `FAIRSHARING_DISPLAY_MAX_ECOSYSTEM_GROUP` | No | Records per relationship group in `analyze_record_ecosystem` (default: 15, 0 = all) |
 
 See `.env.example` for the full list including display limits.
 
-## Tools (96 total)
+## Tools (97 total)
 
 All tools are prefixed with `fairsharing_` and support both `markdown` (default) and `json` output formats via the `output_format` parameter.
 
@@ -145,11 +148,12 @@ All tools are prefixed with `fairsharing_` and support both `markdown` (default)
 | `fairsharing_advanced_filter_records` | Search with all filters including FAIR indicators |
 | `fairsharing_search_by_doi` | Look up a record by DOI or FAIRsharing URL |
 
-### Records (7 tools)
+### Records (8 tools)
 
 | Tool | Description |
 |------|-------------|
 | `fairsharing_get_record` | Get detailed information about a record |
+| `fairsharing_list_associations` | Enumerate ALL of a record's associations, paginated, with exact relationship labels |
 | `fairsharing_get_record_graph` | Get a record's relationship graph |
 | `fairsharing_get_record_types` | List all record types |
 | `fairsharing_filter_records_by_date` | Find records by creation/update year range |
@@ -331,7 +335,7 @@ ranking standards by adoption, policy endorsement, and stability.
 
 ## Output Formats
 
-All 96 tools accept `output_format` parameter:
+All 97 tools accept `output_format` parameter:
 
 - **`"markdown"`** (default) — Human-readable formatted output
 - **`"json"`** — Machine-readable structured data, suitable for programmatic chaining between tools
@@ -344,7 +348,7 @@ server.py -> tools/__init__.py -> tools/*.py -> app.py -> client.py -> FAIRshari
 
 - **FastMCP** framework with stdio transport
 - **Async GraphQL client** with token bucket rate limiting (5 RPS), LRU response cache (500 entries), connection pooling
-- **96 tools** across 11 domain modules with MCP annotations (`readOnlyHint`, `idempotentHint`, `openWorldHint`)
+- **97 tools** across 12 domain modules with MCP annotations (`readOnlyHint`, `idempotentHint`, `openWorldHint`)
 - **Pydantic Field validation** on all tool parameters (range constraints, patterns, descriptions)
 - **Pure Python** graph algorithms (no networkx) — CPU-bound work offloaded to `asyncio.to_thread()`
 - **27 GraphQL query constants** including `advancedSearch` for server-side FAIR indicator filtering
@@ -354,7 +358,7 @@ See `CLAUDE.md` for detailed architecture documentation.
 ## Development
 
 ```bash
-# Run all tests (282 tests)
+# Run all tests (332 tests)
 python -m pytest tests/test_server.py
 
 # Run specific tests
